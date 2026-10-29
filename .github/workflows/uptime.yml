@@ -1,0 +1,71 @@
+name: Uptime
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # every 5 minutes (GitHub may delay scheduled runs by a few minutes)
+    - cron: "17 6 * * 1"    # weekly keep-alive (GitHub pauses schedules in repos idle for 60 days)
+  workflow_dispatch:
+    inputs:
+      simulate_outage:
+        description: "Test the alerting: pretend something is down"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run checks
+        id: checks
+        continue-on-error: true
+        env:
+          SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
+          SIMULATE_OUTAGE: ${{ inputs.simulate_outage }}
+        run: python3 check.py
+
+      # Something is down: open an outage issue (GitHub emails you), or add to the open one.
+      - name: Report outage
+        if: steps.checks.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create outage --color B60205 --description "Sokie is down" 2>/dev/null || true
+          down="$(cat down.txt 2>/dev/null || echo 'unknown')"
+          open="$(gh issue list --label outage --state open --json number --jq '.[0].number')"
+          body="$(printf 'Detected %s UTC\n\n%s\n\n[Run log](%s/%s/actions/runs/%s)' "$(date -u '+%Y-%m-%d %H:%M')" "$(cat report.md)" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")"
+          if [ -z "$open" ]; then
+            gh issue create --title "🔴 Sokie outage: $down" --label outage --body "$body"
+          else
+            gh issue comment "$open" --body "Still down. $body"
+          fi
+          exit 1
+
+      # All good again: close any open outage issue.
+      - name: Close recovered outage
+        if: steps.checks.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for n in $(gh issue list --label outage --state open --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "✅ Recovered at $(date -u '+%Y-%m-%d %H:%M') UTC. $(cat report.md)"
+          done
+
+      - name: Weekly keep-alive
+        if: github.event.schedule == '17 6 * * 1'
+        run: |
+          date -u '+%Y-%m-%dT%H:%M:%SZ' > .keepalive
+          git config user.name "sokie-status"
+          git config user.email "actions@users.noreply.github.com"
+          git add .keepalive
+          git commit -m "Keep-alive" && git push || true
